@@ -32,3 +32,16 @@ Copy the `.so` to the host plugin directory, for example:
 
 Enable it under `plugins.configs.task-id-sanitize` in CLIProxyAPI
 `config.yaml` and restart the proxy.
+
+## Tests
+
+```bash
+CGO_ENABLED=1 go test .
+```
+
+Against a running CLIProxyAPI (optional; skipped unless `CPA_API_KEY` is set):
+
+```bash
+CPA_API_KEY=... CPA_BASE_URL=http://127.0.0.1:8320/v1 CPA_MODEL=grok-4.6 \
+  CGO_ENABLED=1 go test -tags live -count=1 -timeout 90s .
+```
