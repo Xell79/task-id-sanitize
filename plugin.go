@@ -52,7 +52,7 @@ const (
 	abiVersion    uint32 = 1
 	schemaVersion uint32 = 1
 	pluginName           = "task-id-sanitize"
-	pluginVersion        = "0.1.1"
+	pluginVersion        = "0.1.2"
 	defaultLog           = "/opt/cli-proxy-api/logs/task-id-sanitize.log"
 )
 
@@ -104,8 +104,9 @@ var (
 	logMu   sync.Mutex
 	logPath = defaultLog
 
-	streamMu sync.Mutex
-	streams  = map[string]*sseSanitizer{}
+	streamMu    sync.Mutex
+	streams     = map[string]*sseSanitizer{}
+	lastVersion string
 )
 
 func main() {}
@@ -153,12 +154,14 @@ func cliproxyPluginFree(ptr unsafe.Pointer, _ C.size_t) {
 }
 
 //export cliproxyPluginShutdown
-func cliproxyPluginShutdown() {}
+func cliproxyPluginShutdown() {
+	resetRuntime("shutdown")
+}
 
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case "plugin.register", "plugin.reconfigure":
-		configure(request)
+		configure(request, method)
 		reg := pluginRegistration()
 		raw, err := okEnvelope(reg)
 		if err == nil {
@@ -179,7 +182,21 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	}
 }
 
-func configure(raw []byte) {
+func resetRuntime(reason string) {
+	streamMu.Lock()
+	n := len(streams)
+	streams = map[string]*sseSanitizer{}
+	streamMu.Unlock()
+	writeLog(map[string]any{
+		"ts":      time.Now().UTC().Format(time.RFC3339Nano),
+		"event":   "plugin.reset",
+		"reason":  reason,
+		"version": pluginVersion,
+		"streams": n,
+	})
+}
+
+func configure(raw []byte, method string) {
 	var req lifecycleRequest
 	if len(raw) > 0 {
 		_ = json.Unmarshal(raw, &req)
@@ -187,12 +204,26 @@ func configure(raw []byte) {
 	if p := os.Getenv("TASK_ID_SANITIZE_LOG"); p != "" {
 		logPath = p
 	}
+	prev := lastVersion
 	writeLog(map[string]any{
-		"ts":      time.Now().UTC().Format(time.RFC3339Nano),
-		"event":   "plugin.configure",
-		"version": pluginVersion,
-		"log":     logPath,
+		"ts":       time.Now().UTC().Format(time.RFC3339Nano),
+		"event":    "plugin.configure",
+		"method":   method,
+		"version":  pluginVersion,
+		"previous": prev,
+		"log":      logPath,
 	})
+	if prev != "" && prev != pluginVersion {
+		writeLog(map[string]any{
+			"ts":       time.Now().UTC().Format(time.RFC3339Nano),
+			"event":    "plugin.upgrade",
+			"from":     prev,
+			"to":       pluginVersion,
+			"method":   method,
+		})
+	}
+	lastVersion = pluginVersion
+	resetRuntime(method)
 }
 
 func pluginRegistration() registration {

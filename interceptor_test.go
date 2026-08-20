@@ -24,6 +24,25 @@ func decodeIntercept(t *testing.T, raw []byte) interceptResp {
 	return resp
 }
 
+func TestConfigureUpgradeResetsStreams(t *testing.T) {
+	dir := t.TempDir()
+	logPath = dir + "/plugin.log"
+	lastVersion = "0.1.1"
+	streamMu.Lock()
+	streams["k"] = newSSESanitizer()
+	streamMu.Unlock()
+	configure(nil, "plugin.reconfigure")
+	streamMu.Lock()
+	n := len(streams)
+	streamMu.Unlock()
+	if n != 0 {
+		t.Fatalf("streams after upgrade reconfigure: %d", n)
+	}
+	if lastVersion != pluginVersion {
+		t.Fatalf("lastVersion=%q want %q", lastVersion, pluginVersion)
+	}
+}
+
 func TestInterceptJSON_StripsUUIDToolCall(t *testing.T) {
 	body := []byte(`{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"task","arguments":"{\"description\":\"Lint\",\"prompt\":\"p\",\"subagent_type\":\"linter\",\"task_id\":\"91416d27-10d9-45cc-a680-80ed290fe955\"}"}}]}}]}`)
 	raw, _ := json.Marshal(map[string]any{"Body": body, "Model": "grok-4.6"})
