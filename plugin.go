@@ -42,6 +42,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -51,7 +52,7 @@ const (
 	abiVersion    uint32 = 1
 	schemaVersion uint32 = 1
 	pluginName           = "task-id-sanitize"
-	pluginVersion        = "0.1.0"
+	pluginVersion        = "0.1.1"
 	defaultLog           = "/opt/cli-proxy-api/logs/task-id-sanitize.log"
 )
 
@@ -82,6 +83,7 @@ type registrationCapability struct {
 }
 
 type interceptReq struct {
+	RequestID       string         `json:"RequestID"`
 	SourceFormat    string         `json:"SourceFormat"`
 	Model           string         `json:"Model"`
 	RequestedModel  string         `json:"RequestedModel"`
@@ -275,7 +277,9 @@ func interceptStream(raw []byte) ([]byte, error) {
 			for _, ev := range events {
 				logStrip(ev, req, req.ChunkIndex)
 			}
-			return okEnvelope(interceptResp{DropChunk: true})
+			// Never DropChunk: CPA treats a missing first payload as
+			// empty_stream, retries, and marks xAI auth unavailable.
+			return okEnvelope(interceptResp{})
 		}
 		joined := bytes.Join(pieces, nil)
 		for _, ev := range events {
@@ -297,6 +301,9 @@ func interceptStream(raw []byte) ([]byte, error) {
 }
 
 func streamKey(req interceptReq) string {
+	if id := strings.TrimSpace(req.RequestID); id != "" {
+		return id + "|" + req.Model
+	}
 	seed := req.OriginalRequest
 	if len(seed) == 0 {
 		seed = req.RequestBody

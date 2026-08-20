@@ -236,74 +236,47 @@ func stripXMLTaskID(s, source string) (string, *stripEvent, bool) {
 	return out, ev, changed
 }
 
-// sseSanitizer holds incomplete SSE events until a task tool-call's
-// arguments JSON is complete, then strips a bogus task_id.
-type sseSanitizer struct {
-	buf      []byte
-	calls    map[string]*callAcc
-	pending  [][]byte
-	holdTask bool
-}
-
-type callAcc struct {
-	id        string
-	index     string
-	name      string
-	args      strings.Builder
-	held      [][]byte
-	namedTask bool
-}
+// sseSanitizer rewrites one stream chunk at a time. It never holds a
+// chunk across Push calls: CPA treats a missing first payload as
+// empty_stream and then marks the upstream auth unavailable.
+type sseSanitizer struct{}
 
 func newSSESanitizer() *sseSanitizer {
-	return &sseSanitizer{calls: make(map[string]*callAcc)}
-}
-
-func callKey(index any, id string) string {
-	if index != nil && fmt.Sprint(index) != "<nil>" && fmt.Sprint(index) != "" {
-		return fmt.Sprintf("idx:%v", index)
-	}
-	if id != "" {
-		return "id:" + id
-	}
-	return "idx:0"
+	return &sseSanitizer{}
 }
 
 func (s *sseSanitizer) Push(chunk []byte) (out [][]byte, events []*stripEvent) {
 	if len(bytes.TrimSpace(chunk)) == 0 {
 		return [][]byte{chunk}, nil
 	}
-	s.buf = append(s.buf, chunk...)
+	rest := chunk
 	for {
-		event, rest, ok := splitSSE(s.buf)
+		event, next, ok := splitSSE(rest)
 		if !ok {
+			if len(rest) == 0 {
+				break
+			}
+			flushed, evs := s.handleEvent(rest)
+			out = append(out, flushed...)
+			events = append(events, evs...)
 			break
 		}
-		s.buf = rest
+		rest = next
 		flushed, evs := s.handleEvent(event)
 		out = append(out, flushed...)
 		events = append(events, evs...)
+	}
+	if len(out) == 0 {
+		return [][]byte{chunk}, events
 	}
 	return out, events
 }
 
 func (s *sseSanitizer) Flush() (out [][]byte, events []*stripEvent) {
-	if len(s.buf) > 0 {
-		flushed, evs := s.handleEvent(s.buf)
-		out = append(out, flushed...)
-		events = append(events, evs...)
-		s.buf = nil
-	}
-	flushed, evs := s.flushHeldSanitized()
-	out = append(out, flushed...)
-	events = append(events, evs...)
-	if len(s.pending) > 0 {
-		out = append(out, s.pending...)
-		s.pending = nil
-	}
-	return out, events
+	return nil, nil
 }
 
-var taskIDJSONRE = regexp.MustCompile(`(?i),"task_id"\s*:\s*"(?:\\.|[^"\\])*"|,"task_id"\s*:\s*[^,}\]]+|"task_id"\s*:\s*"(?:\\.|[^"\\])*",|"task_id"\s*:\s*[^,}\]]+,`)
+var taskIDJSONRE = regexp.MustCompile(`(?i)(?:,\s*)?"task_id"\s*:\s*"(?:\\.|[^"\\])*"|(?:,\s*)?"task_id"\s*:\s*[^,}\]\s"]+`)
 
 func stripTaskIDFromIncomplete(args string) (string, *stripEvent, bool) {
 	if !strings.Contains(args, "task_id") {
@@ -322,39 +295,6 @@ func stripTaskIDFromIncomplete(args string) (string, *stripEvent, bool) {
 		return args, nil, false
 	}
 	return next, &stripEvent{Tool: "task", Removed: removed, Reason: "not_ses_prefix", Source: "sse-incomplete"}, true
-}
-
-func (s *sseSanitizer) flushHeldSanitized() (out [][]byte, events []*stripEvent) {
-	for key, c := range s.calls {
-		if len(c.held) == 0 {
-			continue
-		}
-		acc := c.args.String()
-		if next, ev, complete := sanitizeArgumentsJSON(acc); complete {
-			if ev != nil {
-				ev.HeldN = len(c.held)
-				events = append(events, ev)
-				out = append(out, rebuildTaskEvent(c.held[len(c.held)-1], c, next))
-			} else {
-				out = append(out, c.held...)
-			}
-			c.held = nil
-			delete(s.calls, key)
-			continue
-		}
-		if next, ev, stripped := stripTaskIDFromIncomplete(acc); stripped {
-			ev.HeldN = len(c.held)
-			events = append(events, ev)
-			out = append(out, rebuildTaskEvent(c.held[len(c.held)-1], c, next))
-			c.held = nil
-			delete(s.calls, key)
-			continue
-		}
-		out = append(out, c.held...)
-		c.held = nil
-		delete(s.calls, key)
-	}
-	return out, events
 }
 
 func splitSSE(buf []byte) (event, rest []byte, ok bool) {
@@ -388,157 +328,81 @@ func sseDataPayload(event []byte) []byte {
 func (s *sseSanitizer) handleEvent(event []byte) (out [][]byte, events []*stripEvent) {
 	payload := sseDataPayload(event)
 	if len(payload) == 0 {
-		return s.flushNonTask(event), nil
+		return [][]byte{event}, nil
 	}
 	if bytes.Equal(bytes.TrimSpace(payload), []byte("[DONE]")) {
-		flushed, evs := s.flushHeldSanitized()
-		flushed = append(flushed, event)
-		return flushed, evs
+		return [][]byte{event}, nil
 	}
 	if !json.Valid(payload) {
-		return s.flushNonTask(event), nil
+		return [][]byte{event}, nil
 	}
 	var root any
 	if err := json.Unmarshal(payload, &root); err != nil {
-		return s.flushNonTask(event), nil
+		return [][]byte{event}, nil
 	}
 
-	deltas := collectArgDeltas(root)
-	if len(deltas) == 0 {
-		// Whole-object tool call (non-delta) — sanitize in place.
-		sanitized, ev, complete := sanitizeCompleteJSON(payload, "sse")
-		if complete && ev != nil {
-			return [][]byte{rebuildSSE(event, sanitized)}, []*stripEvent{ev}
-		}
-		return s.flushNonTask(event), nil
+	// Whole-object tool call (non-delta) — sanitize in place.
+	sanitized, ev, complete := sanitizeCompleteJSON(payload, "sse")
+	if complete && ev != nil {
+		return [][]byte{rebuildSSE(event, sanitized)}, []*stripEvent{ev}
 	}
 
-	var heldForTask bool
-	for _, d := range deltas {
-		key := callKey(d.Index, d.ID)
-		c := s.calls[key]
-		if c == nil {
-			c = &callAcc{id: d.ID, index: fmt.Sprint(d.Index)}
-			s.calls[key] = c
-		}
-		if d.ID != "" {
-			c.id = d.ID
-		}
-		if d.Name != "" {
-			c.name = d.Name
-			c.namedTask = looksLikeTaskName(d.Name)
-		}
-		if d.Args != "" {
-			c.args.WriteString(d.Args)
-		}
-		if c.namedTask || c.name == "" {
-			c.held = append(c.held, event)
-			heldForTask = true
-		}
-		if c.namedTask {
-			acc := c.args.String()
-			if next, ev, complete := sanitizeArgumentsJSON(acc); complete {
-				if ev != nil {
-					rebuilt := rebuildTaskEvent(event, c, next)
-					ev.HeldN = len(c.held)
-					c.held = nil
-					c.args.Reset()
-					c.args.WriteString(next)
-					return [][]byte{rebuilt}, []*stripEvent{ev}
-				}
-				// complete and clean: release held as-is
-				out = append(out, c.held...)
-				c.held = nil
-				return out, nil
-			}
-		} else if c.name != "" {
-			// Named something other than task: release.
-			out = append(out, c.held...)
-			c.held = nil
-			if !heldForTask {
-				out = append(out, event)
-			}
-			return out, nil
-		}
+	changed, sev := stripTaskIDInArgTree(root)
+	if !changed || sev == nil {
+		return [][]byte{event}, nil
 	}
-	if heldForTask {
-		return nil, nil
+	outJSON, err := json.Marshal(root)
+	if err != nil {
+		return [][]byte{event}, []*stripEvent{sev}
 	}
-	return [][]byte{event}, nil
+	return [][]byte{rebuildSSE(event, outJSON)}, []*stripEvent{sev}
 }
 
-func (s *sseSanitizer) flushNonTask(event []byte) [][]byte {
-	var out [][]byte
-	for _, c := range s.calls {
-		if !c.namedTask && len(c.held) > 0 {
-			out = append(out, c.held...)
-			c.held = nil
+func stripTaskIDInArgTree(v any) (bool, *stripEvent) {
+	switch t := v.(type) {
+	case map[string]any:
+		name := stringField(t, "name")
+		if fn, ok := t["function"].(map[string]any); ok && name == "" {
+			name = stringField(fn, "name")
 		}
-	}
-	out = append(out, event)
-	return out
-}
-
-type argDelta struct {
-	ID    string
-	Index any
-	Name  string
-	Args  string
-}
-
-func collectArgDeltas(v any) []argDelta {
-	var out []argDelta
-	var walk func(any)
-	walk = func(node any) {
-		m, ok := node.(map[string]any)
-		if !ok {
-			if arr, ok := node.([]any); ok {
-				for _, c := range arr {
-					walk(c)
-				}
-			}
-			return
-		}
-		// OpenAI chat completions: choices[].delta.tool_calls[]
-		if tcs, ok := m["tool_calls"].([]any); ok {
-			for _, raw := range tcs {
-				tm, ok := raw.(map[string]any)
-				if !ok {
+		skip := name != "" && !looksLikeTaskName(name)
+		if !skip {
+			for _, key := range []string{"arguments", "partial_json"} {
+				raw, ok := t[key].(string)
+				if !ok || raw == "" || !strings.Contains(raw, "task_id") {
 					continue
 				}
-				d := argDelta{ID: stringField(tm, "id"), Index: tm["index"]}
-				if fn, ok := tm["function"].(map[string]any); ok {
-					d.Name = stringField(fn, "name")
-					d.Args = stringField(fn, "arguments")
+				next, ev, complete := sanitizeArgumentsJSON(raw)
+				if !complete {
+					next, ev, complete = stripTaskIDFromIncomplete(raw)
 				}
-				if d.Name == "" {
-					d.Name = stringField(tm, "name")
-				}
-				if d.Args == "" {
-					d.Args = stringField(tm, "arguments")
-				}
-				if d.Name != "" || d.Args != "" || d.ID != "" {
-					out = append(out, d)
+				if complete && ev != nil {
+					t[key] = next
+					return true, ev
 				}
 			}
-			return
-		}
-		if args, ok := m["arguments"].(string); ok && args != "" {
-			d := argDelta{Args: args, Name: stringField(m, "name"), ID: stringField(m, "id")}
-			if fn, ok := m["function"].(map[string]any); ok && d.Name == "" {
-				d.Name = stringField(fn, "name")
+			if fn, ok := t["function"].(map[string]any); ok {
+				if changed, ev := stripTaskIDInArgTree(fn); changed {
+					return true, ev
+				}
 			}
-			out = append(out, d)
 		}
-		if partial, ok := m["partial_json"].(string); ok && partial != "" {
-			out = append(out, argDelta{Args: partial, Name: stringField(m, "name"), ID: stringField(m, "id")})
+		for k, child := range t {
+			if k == "function" {
+				continue
+			}
+			if changed, ev := stripTaskIDInArgTree(child); changed {
+				return true, ev
+			}
 		}
-		for _, child := range m {
-			walk(child)
+	case []any:
+		for _, child := range t {
+			if changed, ev := stripTaskIDInArgTree(child); changed {
+				return true, ev
+			}
 		}
 	}
-	walk(v)
-	return out
+	return false, nil
 }
 
 func rebuildSSE(original []byte, payload []byte) []byte {
@@ -567,78 +431,6 @@ func rebuildSSE(original []byte, payload []byte) []byte {
 		b.WriteByte('\n')
 	}
 	return b.Bytes()
-}
-
-func rebuildTaskEvent(original []byte, c *callAcc, args string) []byte {
-	payload := sseDataPayload(original)
-	var root any
-	if err := json.Unmarshal(payload, &root); err != nil {
-		// Fallback synthetic OpenAI chunk.
-		syn, _ := json.Marshal(map[string]any{
-			"choices": []any{map[string]any{
-				"index": 0,
-				"delta": map[string]any{
-					"tool_calls": []any{map[string]any{
-						"index": 0,
-						"id":    c.id,
-						"type":  "function",
-						"function": map[string]any{
-							"name":      "task",
-							"arguments": args,
-						},
-					}},
-				},
-			}},
-		})
-		return rebuildSSE(original, syn)
-	}
-	injectArgs(root, c, args)
-	out, err := json.Marshal(root)
-	if err != nil {
-		return rebuildSSE(original, payload)
-	}
-	return rebuildSSE(original, out)
-}
-
-func injectArgs(v any, c *callAcc, args string) {
-	m, ok := v.(map[string]any)
-	if !ok {
-		if arr, ok := v.([]any); ok {
-			for _, child := range arr {
-				injectArgs(child, c, args)
-			}
-		}
-		return
-	}
-	if tcs, ok := m["tool_calls"].([]any); ok {
-		for _, raw := range tcs {
-			tm, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			fn, _ := tm["function"].(map[string]any)
-			if fn == nil {
-				fn = map[string]any{}
-				tm["function"] = fn
-			}
-			if c.name != "" {
-				fn["name"] = c.name
-			}
-			fn["arguments"] = args
-			if c.id != "" {
-				tm["id"] = c.id
-			}
-		}
-	}
-	if _, ok := m["arguments"].(string); ok {
-		m["arguments"] = args
-		if c.name != "" && stringField(m, "name") == "" {
-			m["name"] = c.name
-		}
-	}
-	for _, child := range m {
-		injectArgs(child, c, args)
-	}
 }
 
 func looksLikeSSE(b []byte) bool {

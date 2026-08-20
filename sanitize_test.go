@@ -61,23 +61,26 @@ func TestSanitizeCompleteJSON_ToolCall(t *testing.T) {
 	}
 }
 
-func TestSSE_HoldUntilCompleteThenStrip(t *testing.T) {
+func TestSSE_PassThroughThenStripUUIDFragment(t *testing.T) {
 	s := newSSESanitizer()
 	nameEvt := []byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"task\",\"arguments\":\"\"}}]}}]}\n\n")
 	part1 := []byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"description\\\":\\\"Lint D3 eval files\\\",\\\"prompt\\\":\\\"x\\\",\\\"subagent_type\\\":\\\"linter\\\",\"}}]}}]}\n\n")
 	part2 := []byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"task_id\\\":\\\"ed99969c-e722-4310-b127-0a8e2e2641fd\\\"}\"}}]}}]}\n\n")
 
 	out, evs := s.Push(nameEvt)
-	if len(out) != 0 {
-		t.Fatalf("name chunk should be held, got %d", len(out))
+	if len(out) == 0 {
+		t.Fatal("name chunk must be forwarded (no DropChunk / empty_stream)")
+	}
+	if len(evs) != 0 {
+		t.Fatalf("name chunk should not strip, events=%d", len(evs))
 	}
 	out, evs = s.Push(part1)
-	if len(out) != 0 {
-		t.Fatalf("incomplete args should be held, got %d: %s", len(out), out)
+	if len(out) == 0 {
+		t.Fatal("incomplete args without task_id must be forwarded")
 	}
 	out, evs = s.Push(part2)
 	if len(evs) != 1 {
-		t.Fatalf("expected 1 strip event, got %d", len(evs))
+		t.Fatalf("expected 1 strip event, got %d out=%s", len(evs), out)
 	}
 	if evs[0].Removed != "ed99969c-e722-4310-b127-0a8e2e2641fd" {
 		t.Fatalf("removed = %q", evs[0].Removed)
@@ -89,8 +92,8 @@ func TestSSE_HoldUntilCompleteThenStrip(t *testing.T) {
 	if strings.Contains(joined, "ed99969c-e722-4310-b127-0a8e2e2641fd") {
 		t.Fatalf("uuid leaked: %s", joined)
 	}
-	if !strings.Contains(joined, "subagent_type") {
-		t.Fatalf("args lost: %s", joined)
+	if strings.Contains(joined, "task_id") {
+		t.Fatalf("task_id remains: %s", joined)
 	}
 }
 
@@ -122,6 +125,38 @@ func TestStripIncomplete(t *testing.T) {
 	}
 	if strings.Contains(out, "task_id") {
 		t.Fatalf("task_id remains: %s", out)
+	}
+}
+
+func TestInterceptStreamNeverDropsFirstChunk(t *testing.T) {
+	nameEvt := []byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"task\",\"arguments\":\"\"}}]}}]}\n\n")
+	raw, err := json.Marshal(map[string]any{
+		"Body":       nameEvt,
+		"ChunkIndex": 0,
+		"Model":      "grok-4.6",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := interceptStream(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatal(err)
+	}
+	if !env.OK {
+		t.Fatalf("envelope not ok: %s", out)
+	}
+	var resp interceptResp
+	if len(env.Result) > 0 {
+		if err := json.Unmarshal(env.Result, &resp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if resp.DropChunk {
+		t.Fatal("DropChunk on first payload causes empty_stream")
 	}
 }
 

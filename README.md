@@ -23,7 +23,7 @@ Events:
 
 ```bash
 CGO_ENABLED=1 go test .
-CGO_ENABLED=1 go build -buildmode=c-shared -o task-id-sanitize-v0.1.0.so .
+CGO_ENABLED=1 go build -trimpath -ldflags='-s -w' -buildmode=c-shared -o task-id-sanitize-v0.1.1.so .
 ```
 
 Copy the `.so` to the host plugin directory, for example:
