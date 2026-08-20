@@ -8,7 +8,7 @@ invent a UUID on every new Task call, so a subagent never starts. This
 plugin deletes any `task_id` that is not a `ses…` session id, in both
 JSON and SSE tool-call streams.
 
-Current version: **0.1.3** (MIT licensed, see [LICENSE](LICENSE))
+Current version: **0.1.4** (MIT licensed, see [LICENSE](LICENSE))
 
 ## How it works
 
@@ -71,7 +71,7 @@ the ref to a release tag:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Xell79/task-id-sanitize/master/install.sh \
-  | sudo bash -s -- --ref v0.1.3
+  | sudo bash -s -- --ref v0.1.4
 ```
 
 ### install.sh flags
@@ -158,7 +158,7 @@ Events:
 ```bash
 CGO_ENABLED=1 go test .
 CGO_ENABLED=1 go build -trimpath -ldflags='-s -w' -buildmode=c-shared \
-  -o task-id-sanitize-v0.1.3.so .
+  -o task-id-sanitize-v0.1.4.so .
 ```
 
 Copy the `.so` to the host plugin directory, for example:
@@ -190,6 +190,10 @@ CPA_API_KEY=... CPA_BASE_URL=http://127.0.0.1:8320/v1 CPA_MODEL=grok-4.6 \
 
 ## Changelog
 
+- **0.1.4** — deploy fixes: the plugin log is tightened to `0600` even
+  when the file already exists (files created by older versions kept
+  their loose mode); `install.sh` removes its temporary clone
+  directory on exit.
 - **0.1.3** — correctness and security wave: `task_id` as the first key
   no longer produces invalid JSON (incl. duplicate keys and bare SSE
   fragments); XML strip is no longer discarded when the JSON rewrite

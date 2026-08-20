@@ -51,7 +51,7 @@ const (
 	abiVersion    uint32 = 1
 	schemaVersion uint32 = 1
 	pluginName           = "task-id-sanitize"
-	pluginVersion        = "0.1.3"
+	pluginVersion        = "0.1.4"
 	defaultLog           = "/opt/cli-proxy-api/logs/task-id-sanitize.log"
 )
 
@@ -364,9 +364,14 @@ func writeLog(row map[string]any) {
 		return
 	}
 	// 0o600: the log contains removed task_id values and model names.
+	// O_CREATE only applies to new files; enforce the mode on files
+	// created by older plugin versions too.
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return
+	}
+	if info, statErr := f.Stat(); statErr == nil && info.Mode().Perm() != 0o600 {
+		_ = f.Chmod(0o600)
 	}
 	_, _ = f.Write(b)
 	_ = f.Close()

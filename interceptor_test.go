@@ -62,13 +62,42 @@ func TestConfigureRecordsVersionAndLogsUpgrade(t *testing.T) {
 		t.Fatalf("expected plugin.reset log entry, got:\n%s", data)
 	}
 	// SEC-5: the log contains removed task_id values; it must not be
-	// world/group readable.
+	// world/group readable — including for a file created by an older
+	// plugin version with looser permissions (O_CREATE does not
+	// change the mode of an existing file).
 	info, err := os.Stat(dir + "/plugin.log")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Fatalf("log mode = %o, want 600", perm)
+	}
+}
+
+func TestWriteLog_TightensPermissionsOfExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	logFile := dir + "/legacy.log"
+	if err := os.WriteFile(logFile, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	logMu.Lock()
+	oldLog := logPath
+	logPath = logFile
+	logMu.Unlock()
+	t.Cleanup(func() {
+		logMu.Lock()
+		logPath = oldLog
+		logMu.Unlock()
+	})
+
+	writeLog(map[string]any{"event": "test"})
+
+	info, err := os.Stat(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("legacy log mode = %o, want 600 after write", perm)
 	}
 }
 

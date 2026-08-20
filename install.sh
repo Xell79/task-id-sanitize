@@ -18,6 +18,15 @@ PLUGIN_DIR=""
 SERVICE="${CPA_SERVICE:-$DEFAULT_SERVICE}"
 PRIORITY="$DEFAULT_PRIORITY"
 SO_PATH=""
+CLONED_DIR=""
+cleanup() {
+  # Only remove trees this script cloned; --src/--so paths are the
+  # caller's property.
+  if [[ -n "$CLONED_DIR" && -d "$CLONED_DIR" ]]; then
+    rm -rf "$CLONED_DIR"
+  fi
+}
+trap cleanup EXIT
 ENABLE=1
 RESTART=1
 INSTALL_DEPS=1
@@ -480,6 +489,7 @@ fetch_src() {
   git clone --depth 1 --branch "$REF" "$REPO" "$tmp/src" 2>/dev/null \
     || git clone "$REPO" "$tmp/src" && git -C "$tmp/src" checkout "$REF"
   SRC="$tmp/src"
+  CLONED_DIR=$tmp
 }
 
 build_so() {
