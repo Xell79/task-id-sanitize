@@ -86,8 +86,10 @@ The plugin directory is `<plugins.dir>/<os>/<arch>`, for example
 
 ### Dependencies
 
-Listed in [`requirements`](requirements). `install.sh` installs them
-unless you pass `--skip-deps`.
+Listed in [`requirements.txt`](requirements.txt). `install.sh` installs
+the OS packages unless you pass `--skip-deps`. The file follows the pip
+requirements.txt format (comments and blank lines only): this plugin has
+no PyPI dependencies, so `pip install -r requirements.txt` is a no-op.
 
 Required:
 
@@ -101,8 +103,9 @@ Optional:
 - `systemd` — restart `cli-proxy-api` after install
 - `sudo` — write `/opt/cli-proxy-api` when not running as root
 
-There is no Python pip/requirements.txt. Config edits use the Python 3
-standard library only.
+Config edits use the Python 3 standard library only. Do not put OS
+package names (`git`, `gcc`, …) on uncommented lines in
+`requirements.txt`: pip would treat them as PyPI specifiers.
 
 ## Log
 

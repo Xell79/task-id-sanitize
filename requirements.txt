@@ -1,0 +1,24 @@
+# This project has no Python package dependencies.
+# install.sh uses the Python 3 standard library only.
+#
+# pip requirements.txt format:
+#   https://pip.pypa.io/en/stable/reference/requirements-file-format/
+# Lines are UTF-8, one specifier or pip option per line.
+# Blank lines and #-comments are ignored. There are no requirement
+# specifiers here, so `pip install -r requirements.txt` is a no-op.
+#
+# OS packages needed to *build* the plugin (install.sh maps names per
+# distro; do not list them as pip specifiers):
+#   git
+#   curl
+#   ca-certificates
+#   python3
+#   gcc
+#   make
+#   libc headers: libc6-dev (Debian/Ubuntu), glibc-devel (RHEL/Fedora),
+#                 musl-dev (Alpine), glibc/base-devel (Arch)
+#   Go >= 1.22: golang-go / golang / go, or https://go.dev/dl/
+#
+# Optional OS packages:
+#   systemd — restart cli-proxy-api after install
+#   sudo    — write /opt/cli-proxy-api when not running as root
