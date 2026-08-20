@@ -8,7 +8,28 @@ invent a UUID on every new Task call, so a subagent never starts. This
 plugin deletes any `task_id` that is not a `ses…` session id, in both
 JSON and SSE tool-call streams.
 
-Current version: **0.1.2**
+Current version: **0.1.3** (MIT licensed, see [LICENSE](LICENSE))
+
+## How it works
+
+The plugin registers two capabilities with CLIProxyAPI:
+`response_interceptor` and `response_stream_interceptor`.
+
+- Any `task_id` whose value does **not** start with `ses` is deleted:
+  - from `Task` tool-call `arguments` (stringified JSON) and `input`
+    objects in complete (non-stream) responses;
+  - from SSE stream deltas, including arguments fragments that arrive
+    cut mid-object (the fragment is rewritten so no dangling comma is
+    left behind, whatever position `task_id` occupies);
+  - from XML-style `<parameter name="task_id">` payloads, including
+    XML embedded in JSON string values.
+- `ses…` session ids are passed through untouched (resume flows keep
+  working).
+- Rewritten chunks are forwarded, never dropped: CPA treats a missing
+  first payload as `empty_stream` and disables the upstream auth, so
+  `DropChunk` is never set.
+- Sanitization is stateless per chunk — the plugin keeps no data
+  across calls and leaks nothing when a stream ends without `[DONE]`.
 
 ## Install
 
@@ -39,9 +60,19 @@ From a git checkout:
 sudo ./install.sh --src . --upgrade
 ```
 
-The plugin itself resets in-memory stream state on `plugin.register`,
-`plugin.reconfigure`, and shutdown, and logs `plugin.upgrade` when the
-loaded version changes.
+The plugin is stateless across chunks: stream sanitization never holds
+data between calls, and `plugin.register` / `plugin.reconfigure` /
+shutdown log `plugin.upgrade` when the loaded version changes.
+
+### Supply chain
+
+The default install tracks `master`. For a reproducible install, pin
+the ref to a release tag:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Xell79/task-id-sanitize/master/install.sh \
+  | sudo bash -s -- --ref v0.1.3
+```
 
 ### install.sh flags
 
@@ -95,8 +126,8 @@ Required:
 
 - `git`, `curl`, `ca-certificates`, `python3`
 - C toolchain: `gcc`, `make`, libc headers (`libc6-dev` / `glibc-devel` / `musl-dev`)
-- Go **>= 1.22** (distro package if new enough, otherwise the official
-  `go.dev` tarball)
+- Go **>= 1.27** (distro package if new enough, otherwise the official
+  `go.dev` tarball; supported until 2027)
 
 Optional:
 
@@ -111,13 +142,14 @@ package names (`git`, `gcc`, …) on uncommented lines in
 
 Default: `/opt/cli-proxy-api/logs/task-id-sanitize.log`
 
-Override with `TASK_ID_SANITIZE_LOG`.
+Override with `TASK_ID_SANITIZE_LOG`. The file is created with `0600`
+permissions: it records removed `task_id` values and model names.
 
 Events:
 
 - `plugin.configure` — plugin loaded / reconfigured
 - `plugin.upgrade` — in-process version change after an upgrade
-- `plugin.reset` — stream state cleared (`register` / `reconfigure` / shutdown)
+- `plugin.reset` — lifecycle marker (`register` / `reconfigure` / shutdown)
 - `plugin.register.payload` — registration JSON returned to CPA
 - `task_id.stripped` — UUID (or other non-`ses` value) removed
 
@@ -126,7 +158,7 @@ Events:
 ```bash
 CGO_ENABLED=1 go test .
 CGO_ENABLED=1 go build -trimpath -ldflags='-s -w' -buildmode=c-shared \
-  -o task-id-sanitize-v0.1.2.so .
+  -o task-id-sanitize-v0.1.3.so .
 ```
 
 Copy the `.so` to the host plugin directory, for example:
@@ -139,8 +171,15 @@ Enable it under `plugins.configs.task-id-sanitize` in CLIProxyAPI
 ## Tests
 
 ```bash
-CGO_ENABLED=1 go test .
+CGO_ENABLED=1 go test .        # unit tests
+CGO_ENABLED=1 go test -race .  # with the race detector
 ```
+
+The suite covers comma placement in cut JSON fragments (including
+duplicate `task_id` keys and bare fragments without an opening brace),
+nested objects, XML (raw and JSON-escaped), SSE framing (CRLF,
+multi-data-line collapse, keepalive), the plugin dispatch boundary, and
+log file permissions.
 
 Against a running CLIProxyAPI (optional; skipped unless `CPA_API_KEY` is set):
 
@@ -148,3 +187,24 @@ Against a running CLIProxyAPI (optional; skipped unless `CPA_API_KEY` is set):
 CPA_API_KEY=... CPA_BASE_URL=http://127.0.0.1:8320/v1 CPA_MODEL=grok-4.6 \
   CGO_ENABLED=1 go test -tags live -count=1 -timeout 90s .
 ```
+
+## Changelog
+
+- **0.1.3** — correctness and security wave: `task_id` as the first key
+  no longer produces invalid JSON (incl. duplicate keys and bare SSE
+  fragments); XML strip is no longer discarded when the JSON rewrite
+  also fires; JSON-escaped XML (`name=\"task_id\"`) is matched;
+  case-insensitive keys (`Task_ID`) are stripped; stateless sanitizer
+  (no per-stream map); cgo request-length guard; log written `0600`;
+  race-free reconfigure; `install.sh --dry-run` no longer installs
+  packages or Go; Go 1.27; MIT license.
+- **0.1.2** — installer (`install.sh`) with upgrade/prune support,
+  interceptor unit tests, optional live CPA smoke test, pip-format
+  `requirements.txt`.
+- **0.1.1** — never `DropChunk` on the first SSE payload (fixes
+  `empty_stream` → upstream auth marked unavailable).
+- **0.1.0** — initial import.
+
+## License
+
+[MIT](LICENSE) — Copyright (c) 2026 Xell79

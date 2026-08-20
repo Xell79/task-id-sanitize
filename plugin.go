@@ -39,10 +39,9 @@ import "C"
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
+	"math"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -52,7 +51,7 @@ const (
 	abiVersion    uint32 = 1
 	schemaVersion uint32 = 1
 	pluginName           = "task-id-sanitize"
-	pluginVersion        = "0.1.2"
+	pluginVersion        = "0.1.3"
 	defaultLog           = "/opt/cli-proxy-api/logs/task-id-sanitize.log"
 )
 
@@ -104,8 +103,7 @@ var (
 	logMu   sync.Mutex
 	logPath = defaultLog
 
-	streamMu    sync.Mutex
-	streams     = map[string]*sseSanitizer{}
+	stateMu     sync.Mutex
 	lastVersion string
 )
 
@@ -129,21 +127,40 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		response.ptr = nil
 		response.len = 0
 	}
-	if method == nil {
-		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
-		return 1
+	methodStr := ""
+	if method != nil {
+		methodStr = C.GoString(method)
 	}
+	// C.GoBytes takes a C.int length; convert only after the declared
+	// length passed the MaxInt32 guard inside pluginCall (a size_t
+	// above MaxInt32 would wrap negative and panic or corrupt memory).
 	var requestBytes []byte
-	if request != nil && requestLen > 0 {
+	declared := uint64(requestLen)
+	if request != nil && declared > 0 && declared <= math.MaxInt32 {
 		requestBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
-	raw, errHandle := handleMethod(C.GoString(method), requestBytes)
-	if errHandle != nil {
-		writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
+	raw, rc := pluginCall(methodStr, requestBytes, declared)
+	if !writeResponse(response, raw) {
 		return 1
 	}
-	writeResponse(response, raw)
-	return 0
+	return C.int(rc)
+}
+
+// pluginCall is the pure-Go dispatch behind cliproxyPluginCall so the
+// boundary logic is unit-testable without cgo. declaredLen is the
+// buffer length the host announced; it is validated before any use.
+func pluginCall(method string, request []byte, declaredLen uint64) ([]byte, int) {
+	if method == "" {
+		return errorEnvelope("invalid_method", "method is required"), 1
+	}
+	if declaredLen > math.MaxInt32 {
+		return errorEnvelope("invalid_request", "request too large"), 1
+	}
+	raw, errHandle := handleMethod(method, request)
+	if errHandle != nil {
+		return errorEnvelope("plugin_error", errHandle.Error()), 1
+	}
+	return raw, 0
 }
 
 //export cliproxyPluginFree
@@ -183,16 +200,11 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 }
 
 func resetRuntime(reason string) {
-	streamMu.Lock()
-	n := len(streams)
-	streams = map[string]*sseSanitizer{}
-	streamMu.Unlock()
 	writeLog(map[string]any{
 		"ts":      time.Now().UTC().Format(time.RFC3339Nano),
 		"event":   "plugin.reset",
 		"reason":  reason,
 		"version": pluginVersion,
-		"streams": n,
 	})
 }
 
@@ -201,28 +213,35 @@ func configure(raw []byte, method string) {
 	if len(raw) > 0 {
 		_ = json.Unmarshal(raw, &req)
 	}
+	// logPath is read under logMu in writeLog; write it under the
+	// same lock to avoid a data race on reconfigure.
+	logMu.Lock()
 	if p := os.Getenv("TASK_ID_SANITIZE_LOG"); p != "" {
 		logPath = p
 	}
+	lp := logPath
+	logMu.Unlock()
+	stateMu.Lock()
 	prev := lastVersion
+	lastVersion = pluginVersion
+	stateMu.Unlock()
 	writeLog(map[string]any{
 		"ts":       time.Now().UTC().Format(time.RFC3339Nano),
 		"event":    "plugin.configure",
 		"method":   method,
 		"version":  pluginVersion,
 		"previous": prev,
-		"log":      logPath,
+		"log":      lp,
 	})
 	if prev != "" && prev != pluginVersion {
 		writeLog(map[string]any{
-			"ts":       time.Now().UTC().Format(time.RFC3339Nano),
-			"event":    "plugin.upgrade",
-			"from":     prev,
-			"to":       pluginVersion,
-			"method":   method,
+			"ts":     time.Now().UTC().Format(time.RFC3339Nano),
+			"event":  "plugin.upgrade",
+			"from":   prev,
+			"to":     pluginVersion,
+			"method": method,
 		})
 	}
-	lastVersion = pluginVersion
 	resetRuntime(method)
 }
 
@@ -235,10 +254,12 @@ func pluginRegistration() registration {
 			"name":              pluginName,
 			"version":           pluginVersion,
 			"author":            "Xell79",
+			"license":           "MIT",
 			"github_repository": "https://github.com/Xell79/task-id-sanitize",
 			"Name":              pluginName,
 			"Version":           pluginVersion,
 			"Author":            "Xell79",
+			"License":           "MIT",
 			"GitHubRepository":  "https://github.com/Xell79/task-id-sanitize",
 		},
 		Capabilities: registrationCapability{
@@ -281,45 +302,22 @@ func interceptStream(raw []byte) ([]byte, error) {
 		return okEnvelope(interceptResp{})
 	}
 
-	key := streamKey(req)
-	streamMu.Lock()
-	s := streams[key]
-	if s == nil {
-		s = newSSESanitizer()
-		streams[key] = s
-	}
-	streamMu.Unlock()
-
 	body := req.Body
-	var events []*stripEvent
-	var pieces [][]byte
 
-	if looksLikeSSE(body) || bytes.Contains(body, []byte("data:")) {
-		streamMu.Lock()
-		pieces, events = s.Push(body)
-		if bytes.Contains(body, []byte("[DONE]")) {
-			rest, ev2 := s.Flush()
-			pieces = append(pieces, rest...)
-			events = append(events, ev2...)
-			delete(streams, key)
-		}
-		streamMu.Unlock()
-		if len(pieces) == 0 {
-			for _, ev := range events {
-				logStrip(ev, req, req.ChunkIndex)
-			}
-			// Never DropChunk: CPA treats a missing first payload as
-			// empty_stream, retries, and marks xAI auth unavailable.
-			return okEnvelope(interceptResp{})
-		}
+	// Stateless per-chunk sanitization (v0.1.3): the sanitizer never
+	// holds data across calls, so there is no keyed stream state that
+	// could leak when a stream ends without [DONE].
+	if bytes.Contains(body, []byte("data:")) {
+		pieces, events := newSSESanitizer().Push(body)
 		joined := bytes.Join(pieces, nil)
 		for _, ev := range events {
-			ev.ChunkIdx = req.ChunkIndex
 			logStrip(ev, req, req.ChunkIndex)
 		}
 		if bytes.Equal(joined, body) && len(events) == 0 {
 			return okEnvelope(interceptResp{})
 		}
+		// Never DropChunk: CPA treats a missing first payload as
+		// empty_stream, retries, and marks xAI auth unavailable.
 		return okEnvelope(interceptResp{Body: joined})
 	}
 
@@ -331,33 +329,6 @@ func interceptStream(raw []byte) ([]byte, error) {
 	return okEnvelope(interceptResp{})
 }
 
-func streamKey(req interceptReq) string {
-	if id := strings.TrimSpace(req.RequestID); id != "" {
-		return id + "|" + req.Model
-	}
-	seed := req.OriginalRequest
-	if len(seed) == 0 {
-		seed = req.RequestBody
-	}
-	if len(seed) > 0 {
-		sum := 0
-		for _, b := range seed {
-			sum = sum*31 + int(b)
-		}
-		return fmt.Sprintf("%s|%d|%d", req.Model, len(seed), sum)
-	}
-	if req.Metadata != nil {
-		for _, k := range []string{"request_id", "requestID"} {
-			if v, ok := req.Metadata[k]; ok {
-				if s, ok := v.(string); ok && s != "" {
-					return s + "|" + req.Model
-				}
-			}
-		}
-	}
-	return req.Model + "|" + req.RequestedModel
-}
-
 func logStrip(ev *stripEvent, req interceptReq, chunk int) {
 	if ev == nil {
 		return
@@ -367,17 +338,17 @@ func logStrip(ev *stripEvent, req interceptReq, chunk int) {
 		ev.ChunkIdx = chunk
 	}
 	writeLog(map[string]any{
-		"ts":           time.Now().UTC().Format(time.RFC3339Nano),
-		"event":        "task_id.stripped",
-		"tool":         ev.Tool,
-		"removed":      ev.Removed,
-		"reason":       ev.Reason,
-		"source":       ev.Source,
-		"model":        req.Model,
-		"requested":    req.RequestedModel,
-		"chunk_index":  ev.ChunkIdx,
-		"held_events":  ev.HeldN,
-		"uuid_like":    uuidRE.MatchString(ev.Removed),
+		"ts":          time.Now().UTC().Format(time.RFC3339Nano),
+		"event":       "task_id.stripped",
+		"tool":        ev.Tool,
+		"removed":     ev.Removed,
+		"reason":      ev.Reason,
+		"source":      ev.Source,
+		"model":       req.Model,
+		"requested":   req.RequestedModel,
+		"chunk_index": ev.ChunkIdx,
+		"held_events": ev.HeldN,
+		"uuid_like":   uuidRE.MatchString(ev.Removed),
 	})
 }
 
@@ -392,7 +363,8 @@ func writeLog(row map[string]any) {
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
 		return
 	}
-	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	// 0o600: the log contains removed task_id values and model names.
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return
 	}
@@ -413,14 +385,17 @@ func errorEnvelope(code, message string) []byte {
 	return raw
 }
 
-func writeResponse(response *C.cliproxy_buffer, raw []byte) {
+// writeResponse copies raw into the host-provided buffer. It returns
+// false only when the allocation for the response failed.
+func writeResponse(response *C.cliproxy_buffer, raw []byte) bool {
 	if response == nil || len(raw) == 0 {
-		return
+		return true
 	}
 	ptr := C.CBytes(raw)
 	if ptr == nil {
-		return
+		return false
 	}
 	response.ptr = ptr
 	response.len = C.size_t(len(raw))
+	return true
 }

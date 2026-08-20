@@ -6,14 +6,15 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-	"unicode"
 )
 
 const sessionPrefix = "ses"
 
 var (
 	uuidRE = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-	xmlRE  = regexp.MustCompile(`(?is)<parameter\s+name=["']task_id["']\s*>\s*([^<]*?)\s*</parameter>`)
+	// `\\*` tolerates JSON-escaped quotes so the pass also matches
+	// XML embedded in JSON string values (e.g. name=\"task_id\").
+	xmlRE = regexp.MustCompile(`(?is)<parameter\s+name=\\*["']task_id\\*["']\s*>\s*([^<]*?)\s*</parameter>`)
 )
 
 type stripEvent struct {
@@ -34,7 +35,7 @@ func shouldStripTaskID(v any) (string, bool) {
 	s, ok := v.(string)
 	if !ok {
 		if v == nil {
-			return "", true
+			return "null", true
 		}
 		return fmt.Sprint(v), true
 	}
@@ -121,15 +122,29 @@ func sanitizeCompleteJSON(raw []byte, source string) ([]byte, *stripEvent, bool)
 		return raw, nil, false
 	}
 	changed, ev := walkToolCalls(v, source)
-	xmlOut, xmlEv, xmlChanged := stripXMLTaskID(string(raw), source)
-	if xmlChanged && !changed {
-		return []byte(xmlOut), xmlEv, true
+	out := raw
+	if changed {
+		// Re-marshal without HTML escaping so that "<" in string
+		// values (e.g. XML-style tool call bodies) stays literal and
+		// the XML pass below can still see and strip it.
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(v); err != nil {
+			return raw, nil, true
+		}
+		out = bytes.TrimRight(buf.Bytes(), "\n")
+	}
+	// Run the XML pass on the (possibly rewritten) body so a JSON
+	// rewrite no longer discards a simultaneous XML task_id strip.
+	xmlOut, xmlEv, xmlChanged := stripXMLTaskID(string(out), source)
+	if xmlChanged {
+		if ev == nil {
+			ev = xmlEv
+		}
+		return []byte(xmlOut), ev, true
 	}
 	if !changed {
-		return raw, nil, true
-	}
-	out, err := json.Marshal(v)
-	if err != nil {
 		return raw, nil, true
 	}
 	return out, ev, true
@@ -236,9 +251,10 @@ func stripXMLTaskID(s, source string) (string, *stripEvent, bool) {
 	return out, ev, changed
 }
 
-// sseSanitizer rewrites one stream chunk at a time. It never holds a
-// chunk across Push calls: CPA treats a missing first payload as
-// empty_stream and then marks the upstream auth unavailable.
+// sseSanitizer rewrites one stream chunk at a time. It is stateless:
+// Push never holds a chunk across calls (CPA treats a missing first
+// payload as empty_stream and then marks the upstream auth
+// unavailable).
 type sseSanitizer struct{}
 
 func newSSESanitizer() *sseSanitizer {
@@ -272,25 +288,82 @@ func (s *sseSanitizer) Push(chunk []byte) (out [][]byte, events []*stripEvent) {
 	return out, events
 }
 
-func (s *sseSanitizer) Flush() (out [][]byte, events []*stripEvent) {
-	return nil, nil
-}
+var (
+	taskIDJSONRE  = regexp.MustCompile(`(?i)(?:,\s*)?"task_id"\s*:\s*"(?:\\.|[^"\\])*"|(?:,\s*)?"task_id"\s*:\s*[^,}\]\s"]+`)
+	taskIDValueRE = regexp.MustCompile(`(?i)"task_id"\s*:\s*"((?:\\.|[^"\\])*)"`)
+)
 
-var taskIDJSONRE = regexp.MustCompile(`(?i)(?:,\s*)?"task_id"\s*:\s*"(?:\\.|[^"\\])*"|(?:,\s*)?"task_id"\s*:\s*[^,}\]\s"]+`)
-
+// stripTaskIDFromIncomplete removes task_id members from an arguments
+// JSON fragment that may be cut mid-object. taskIDJSONRE consumes a
+// *leading* comma when the member is preceded by one; when the member
+// is the first visible key of its object there is no leading comma, so
+// the *trailing* comma must be swallowed instead. Without that,
+// `{"task_id":"x","a":1}` would become the invalid fragment `{,"a":1}`.
+//
+// "First visible key" is decided by the last non-space byte already
+// emitted to the output buffer, not by scanning the input: duplicate
+// task_id keys back to back form a chain where each removal promotes
+// the next member to first-key position. A fragment that starts
+// mid-object (non-cumulative SSE deltas never contain the opening
+// brace) is also treated as first-key, so its trailing comma is
+// swallowed as well.
 func stripTaskIDFromIncomplete(args string) (string, *stripEvent, bool) {
-	if !strings.Contains(args, "task_id") {
+	// Case-insensitive fast path: the member regexes match (?i), so a
+	// "Task_ID" key must not bypass the strip here.
+	if !strings.Contains(strings.ToLower(args), "task_id") {
 		return args, nil, false
 	}
 	// Best-effort extract of the value for logging.
 	removed := ""
-	if m := regexp.MustCompile(`(?i)"task_id"\s*:\s*"((?:\\.|[^"\\])*)"`).FindStringSubmatch(args); len(m) == 2 {
+	if m := taskIDValueRE.FindStringSubmatch(args); len(m) == 2 {
 		removed = m[1]
 		if isSessionID(removed) {
 			return args, nil, false
 		}
 	}
-	next := taskIDJSONRE.ReplaceAllString(args, "")
+	matches := taskIDJSONRE.FindAllStringIndex(args, -1)
+	if len(matches) == 0 {
+		return args, nil, false
+	}
+	var b strings.Builder
+	last := 0
+	lastNonSpace := byte('{')
+	updateTail := func(s string) {
+		for i := len(s) - 1; i >= 0; i-- {
+			if c := s[i]; c != ' ' && c != '\t' && c != '\r' && c != '\n' {
+				lastNonSpace = c
+				return
+			}
+		}
+	}
+	for _, m := range matches {
+		start, end := m[0], m[1]
+		if end <= last {
+			// Entirely consumed by a previous comma swallow
+			// (duplicate task_id keys back to back).
+			continue
+		}
+		if start < last {
+			// Partially overlapped by a previous comma swallow;
+			// never slice backwards — args[last:start] would panic.
+			start = last
+		}
+		chunk := args[last:start]
+		b.WriteString(chunk)
+		updateTail(chunk)
+		if lastNonSpace == '{' {
+			// First visible key of its object: swallow the trailing
+			// comma (if any) so no dangling comma is left behind.
+			rest := args[end:]
+			trimmed := strings.TrimLeft(rest, " \t\r\n")
+			if strings.HasPrefix(trimmed, ",") {
+				end += len(rest) - len(trimmed) + 1
+			}
+		}
+		last = end
+	}
+	b.WriteString(args[last:])
+	next := b.String()
 	if next == args {
 		return args, nil, false
 	}
@@ -405,6 +478,10 @@ func stripTaskIDInArgTree(v any) (bool, *stripEvent) {
 	return false, nil
 }
 
+// rebuildSSE rewrites an SSE event whose payload was sanitized. It
+// assumes the common single-data-line event shape: all data: lines are
+// collapsed into the first one (multi-line data events would change
+// framing), and the trailing blank line is preserved.
 func rebuildSSE(original []byte, payload []byte) []byte {
 	var b bytes.Buffer
 	wroteData := false
@@ -431,16 +508,4 @@ func rebuildSSE(original []byte, payload []byte) []byte {
 		b.WriteByte('\n')
 	}
 	return b.Bytes()
-}
-
-func looksLikeSSE(b []byte) bool {
-	t := bytes.TrimLeftFunc(b, unicode.IsSpace)
-	return bytes.HasPrefix(t, []byte("data:")) || bytes.Contains(t[:min(len(t), 32)], []byte("data:"))
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

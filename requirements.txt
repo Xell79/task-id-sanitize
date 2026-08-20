@@ -17,7 +17,7 @@
 #   make
 #   libc headers: libc6-dev (Debian/Ubuntu), glibc-devel (RHEL/Fedora),
 #                 musl-dev (Alpine), glibc/base-devel (Arch)
-#   Go >= 1.22: golang-go / golang / go, or https://go.dev/dl/
+#   Go >= 1.27: golang-go / golang / go, or https://go.dev/dl/
 #
 # Optional OS packages:
 #   systemd — restart cli-proxy-api after install

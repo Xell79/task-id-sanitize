@@ -7,7 +7,7 @@ DEFAULT_REPO="https://github.com/Xell79/task-id-sanitize.git"
 DEFAULT_REF="master"
 DEFAULT_SERVICE="cli-proxy-api"
 DEFAULT_PRIORITY="2"
-MIN_GO="1.22"
+MIN_GO="1.27"
 
 REPO="${TASK_ID_SANITIZE_REPO:-$DEFAULT_REPO}"
 REF="${TASK_ID_SANITIZE_REF:-$DEFAULT_REF}"
@@ -166,6 +166,10 @@ detect_pkg() {
 
 install_packages() {
   [[ "$INSTALL_DEPS" -eq 1 ]] || return 0
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "dry-run: skip OS package installation"
+    return 0
+  fi
   local pkg
   pkg=$(detect_pkg)
   log "installing build dependencies ($pkg)"
@@ -221,11 +225,17 @@ install_go() {
     return 0
   fi
 
-  local tarball="go1.22.12.${GOOS}-${GOARCH}.tar.gz"
+  local GO_DL_VER="1.27.0"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "dry-run: skip Go ${GO_DL_VER} tarball installation"
+    go_version_ok && log "using $(go version)" || log "using bundled check: Go >= $MIN_GO required at real install time"
+    return 0
+  fi
+  local tarball="go${GO_DL_VER}.${GOOS}-${GOARCH}.tar.gz"
   local url="https://go.dev/dl/${tarball}"
   local tmp
   tmp=$(mktemp -d)
-  log "installing Go 1.22.12 from go.dev ($GOOS/$GOARCH)"
+  log "installing Go ${GO_DL_VER} from go.dev ($GOOS/$GOARCH)"
   curl -fsSL "$url" -o "$tmp/$tarball"
   if [[ "$(id -u)" -eq 0 ]]; then
     rm -rf /usr/local/go
@@ -321,10 +331,16 @@ PY
 source_version() {
   local file=$1
   python3 - "$file" <<'PY'
-import re, sys
-text = open(sys.argv[1], encoding="utf-8").read()
+import os, re, sys
+path = sys.argv[1]
+if not os.path.isfile(path):
+    # Unknown (e.g. dry-run without --src/--so) must not masquerade
+    # as a real version like 0.0.0.
+    print("unknown")
+    raise SystemExit(0)
+text = open(path, encoding="utf-8").read()
 m = re.search(r'pluginVersion\s*=\s*"([^"]+)"', text)
-print(m.group(1) if m else "0.0.0")
+print(m.group(1) if m else "unknown")
 PY
 }
 
@@ -637,7 +653,7 @@ elif [[ -n "$SO_PATH" ]]; then
   ver=$(so_version "$SO_PATH")
   [[ -n "$ver" ]] || ver="unknown"
 fi
-[[ "$ver" != "unknown" && -n "$ver" ]] || die "cannot determine plugin version"
+[[ "$ver" != "unknown" && -n "$ver" ]] || die "cannot determine plugin version (dry-run of a remote install: pass --src DIR or --so PATH)"
 dest="$PLUGIN_DIR/${PLUGIN_ID}-v${ver}.so"
 decide_upgrade "$ver"
 log "target      : $dest"

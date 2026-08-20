@@ -24,6 +24,8 @@ go.work.sum
 .env
 .env.*
 !.env.example
+.envrc
+.envrc.*
 *.pem
 *.key
 *.crt
@@ -31,6 +33,11 @@ id_rsa
 id_ed25519
 *.p12
 *.pfx
+
+# CPA config / installer test residue (config.yaml holds api-keys)
+config.yaml
+config.yml
+*.bak-task-id-sanitize
 
 # Logs
 *.log
@@ -40,14 +47,23 @@ logs/
 .idea/
 .vscode/
 .zed/
+.history/
 .kilo/
 .kilocode/
 .opencode/
+.claude/
+.continue/
+.aider*
 .codegraph/
+.rumdl_cache/
 *.swp
 *~
 .DS_Store
 Thumbs.db
+
+# Optional Python venv (pip usage of requirements.txt is a no-op)
+.venv/
+venv/
 
 # Local agent ignore aliases (symlinks to .gitignore)
 .aiignore
