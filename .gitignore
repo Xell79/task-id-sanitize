@@ -1,0 +1,58 @@
+# C-ABI / shared library build artifacts
+*.so
+*.dylib
+*.dll
+*.h
+*.a
+*.o
+*.exe
+task-id-sanitize
+task-id-sanitize-v*
+
+# Go test / coverage / profiles
+*.test
+*.out
+*.prof
+coverage.out
+coverage.html
+*.coverprofile
+vendor/
+go.work
+go.work.sum
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+id_rsa
+id_ed25519
+*.p12
+*.pfx
+
+# Logs
+*.log
+logs/
+
+# IDE / editors / local agent state
+.idea/
+.vscode/
+.zed/
+.kilo/
+.kilocode/
+.opencode/
+.codegraph/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local agent ignore aliases (symlinks to .gitignore)
+.aiignore
+.clineignore
+.cursorignore
+.gooseignore
+.kilocodeignore
+.opencodeignore
